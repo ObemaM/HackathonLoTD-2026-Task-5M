@@ -1,0 +1,40 @@
+/**:
+  ros__parameters:
+    # Topic used by the five normal/moving bags.
+    input_topic: /lidar_points
+    output_prefix: /obstacle_detector
+    detector_frame_id: train_lidar
+
+    # Convert dataset sensor coordinates into a conventional detector frame:
+    # detector X = forward, Y = left/lateral, Z = up.
+    forward_axis: -y
+    lateral_axis: x
+    vertical_axis: z
+    detector_offset_xyz: [0.0, 0.0, 0.0]
+
+    # The supplied bags contain finite (0, 0, 0) padding, so min range must be > 0.
+    min_valid_range_m: 0.3
+    max_valid_range_m: 210.0
+    voxel_leaf_size_m: 0.08
+
+    corridor:
+      min_forward_m: 2.0
+      max_forward_m: 200.0
+      center_lateral_m: 0.0
+      width_m: 2.1
+      bottom_z_m: -1.65
+      height_m: 3.0
+      floor_clearance_m: 0.04
+
+    clustering:
+      tolerance_m: 0.30
+      min_points: 3
+      max_points: 50000
+      min_height_m: 0.08
+      max_length_m: 8.0
+      max_width_m: 2.5
+      max_height_m: 3.2
+
+    max_visualized_clusters: 30
+    publish_debug_clouds: true
+

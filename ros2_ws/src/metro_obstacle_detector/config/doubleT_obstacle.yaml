@@ -1,0 +1,39 @@
+/**:
+  ros__parameters:
+    input_topic: /sensing/lidar/hesai128/pointcloud
+    output_prefix: /obstacle_detector
+    detector_frame_id: train_lidar
+
+    forward_axis: -y
+    lateral_axis: x
+    vertical_axis: z
+    detector_offset_xyz: [0.0, 0.0, 0.0]
+
+    min_valid_range_m: 0.3
+    max_valid_range_m: 210.0
+    voxel_leaf_size_m: 0.08
+
+    # Initial visual estimate for this differently mounted lidar.
+    # Recalibrate center_lateral_m and bottom_z_m in RViz before treating
+    # these values as ground truth.
+    corridor:
+      min_forward_m: 0.5
+      max_forward_m: 200.0
+      center_lateral_m: 2.0
+      width_m: 2.1
+      bottom_z_m: -2.3
+      height_m: 3.0
+      floor_clearance_m: 0.04
+
+    clustering:
+      tolerance_m: 0.30
+      min_points: 3
+      max_points: 50000
+      min_height_m: 0.08
+      max_length_m: 8.0
+      max_width_m: 2.5
+      max_height_m: 3.2
+
+    max_visualized_clusters: 30
+    publish_debug_clouds: true
+

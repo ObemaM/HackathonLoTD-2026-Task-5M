@@ -1,0 +1,36 @@
+scenarios:
+  - name: minimum_box_25m_inside
+    source_bag: roundT_doubleT
+    distance_m: 25.0
+    lateral_offset_m: 0.0
+    size_xyz_m: [0.30, 0.30, 0.10]
+    expected_detected: true
+
+  - name: minimum_box_100m_inside
+    source_bag: roundT_doubleT
+    distance_m: 100.0
+    lateral_offset_m: 0.0
+    size_xyz_m: [0.30, 0.30, 0.10]
+    expected_detected: true
+
+  - name: person_100m_inside
+    source_bag: squareT_platform_squareT_switch
+    distance_m: 100.0
+    lateral_offset_m: 0.0
+    size_xyz_m: [0.55, 0.45, 1.80]
+    expected_detected: true
+
+  - name: person_100m_outside_gauge
+    source_bag: doubleT_platform
+    distance_m: 100.0
+    lateral_offset_m: 2.0
+    size_xyz_m: [0.55, 0.45, 1.80]
+    expected_detected: false
+
+  - name: cable_50m_inside
+    source_bag: roundT_pressureGate_roundT
+    distance_m: 50.0
+    lateral_offset_m: 0.0
+    size_xyz_m: [0.05, 0.05, 1.50]
+    expected_detected: true
+

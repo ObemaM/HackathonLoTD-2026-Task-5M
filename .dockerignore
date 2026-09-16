@@ -1,0 +1,12 @@
+.git
+.gitignore
+ros2_ws/build
+ros2_ws/install
+ros2_ws/log
+data
+Info
+*.db3
+*.zst
+*.mcap
+experiments/results
+

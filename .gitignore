@@ -1,0 +1,27 @@
+# ROS 2 / colcon
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# Large local datasets and generated experiment outputs
+data/
+*.db3
+*.zst
+*.mcap
+*.pcd
+*.bag
+experiments/results/*.csv
+experiments/results/*.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+
