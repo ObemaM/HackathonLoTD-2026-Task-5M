@@ -22,6 +22,7 @@ find_package(visualization_msgs REQUIRED)
 
 add_library(detector_core
   src/axis_mapping.cpp
+  src/track_path.cpp
 )
 target_include_directories(detector_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -65,7 +66,10 @@ if(BUILD_TESTING)
   ament_add_gtest(test_axis_mapping test/test_axis_mapping.cpp)
   target_link_libraries(test_axis_mapping detector_core Eigen3::Eigen)
   target_include_directories(test_axis_mapping PRIVATE include)
+
+  ament_add_gtest(test_track_path test/test_track_path.cpp)
+  target_link_libraries(test_track_path detector_core Eigen3::Eigen)
+  target_include_directories(test_track_path PRIVATE include)
 endif()
 
 ament_package()
-

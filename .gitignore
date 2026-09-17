@@ -12,6 +12,7 @@ data/
 *.bag
 experiments/results/*.csv
 experiments/results/*.json
+experiments/results/*.png
 
 # Python
 __pycache__/
@@ -23,5 +24,4 @@ __pycache__/
 .vscode/
 .DS_Store
 Thumbs.db
-
 

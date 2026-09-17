@@ -58,7 +58,12 @@ Visualization Manager:
       Namespaces:
         candidate_boxes: true
         candidate_labels: true
-        corridor: true
+        corridor_fallback: true
+        dynamic_corridor: true
+        estimated_rails: true
+        masked_longitudinal_structure: true
+        route_ambiguity: true
+        track_center: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -82,17 +87,13 @@ Visualization Manager:
   Value: true
   Views:
     Current:
-      Class: rviz_default_plugins/Orbit
-      Distance: 45
-      Focal Point:
-        X: 25
-        Y: 0
-        Z: 0
+      Angle: 0
+      Class: rviz_default_plugins/TopDownOrtho
       Name: Current View
-      Pitch: 0.45
+      Scale: 45
       Target Frame: train_lidar
-      Yaw: 3.14
+      X: 30
+      Y: 0
 Window Geometry:
   Height: 900
   Width: 1440
-

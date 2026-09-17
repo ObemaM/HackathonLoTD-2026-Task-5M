@@ -26,6 +26,74 @@
       height_m: 3.0
       floor_clearance_m: 0.04
 
+    # Estimate our own pair of rails in a low height slice.  A dynamic-programming
+    # search is anchored to the near-field pair, then grows outwards while
+    # preserving rail identity.  A local centerline follows curves without a
+    # global parabola bending early.  Competing branches truncate the trusted
+    # corridor instead of forcing an arbitrary turnout choice.
+    track:
+      enabled: true
+      max_forward_m: 90.0
+      initial_center_lateral_m: 0.0
+      search_half_width_m: 4.0
+      rail_z_min_m: -1.75
+      rail_z_max_m: -1.15
+      gauge_m: 1.52
+      max_gauge_error_m: 0.18
+      rail_support_half_width_m: 0.14
+      forward_bin_size_m: 2.0
+      lateral_step_m: 0.05
+      min_points_per_rail: 2
+      min_support_bins: 6
+      max_center_step_m: 0.55
+      max_slope_change: 0.10
+      seed_penalty: 20.0
+      seed_search_bins: 5
+      seed_max_offset_m: 0.85
+      continuity_penalty: 6.0
+      prior_penalty: 1.5
+      prior_max_deviation_m: 0.65
+      max_gap_bins: 1
+      candidate_min_separation_m: 0.25
+      branch_min_separation_m: 0.45
+      branch_max_separation_m: 1.80
+      branch_score_ratio: 0.75
+      branch_min_growth_m_per_bin: 0.05
+      branch_confirmation_bins: 4
+      max_extrapolation_m: 2.0
+      smoothing_alpha: 0.35
+      fallback_frames: 5
+
+    # Remove only a narrow band matching the two estimated rail heads.  We do
+    # not remove all low points, because a cable or box can also lie on the floor.
+    rail_mask:
+      enabled: true
+      lateral_tolerance_m: 0.12
+      min_z_m: -1.62
+      max_z_m: -1.05
+
+    # Discover other persistent low lines (contact rail, guard rail, etc.) in
+    # coordinates relative to the curved path. Compact objects occupy too few
+    # forward bins and are not included in this mask.
+    longitudinal_mask:
+      enabled: true
+      min_z_m: -1.65
+      max_z_m: -1.00
+      forward_bin_size_m: 2.0
+      lateral_cell_size_m: 0.05
+      lane_tolerance_m: 0.14
+      min_points_per_bin: 2
+      min_support_bins: 8
+      max_lanes: 6
+
+    # Rail returns can remain connected through sleepers after point masking.
+    # Reject only long, low clusters that still overlap an estimated rail. A
+    # compact object and a cable away from the rail model are retained.
+    infrastructure_filter:
+      min_length_m: 3.0
+      max_height_above_floor_m: 0.65
+      rail_overlap_margin_m: 0.18
+
     clustering:
       tolerance_m: 0.30
       min_points: 3
@@ -35,6 +103,9 @@
       max_width_m: 2.5
       max_height_m: 3.2
 
-    max_visualized_clusters: 30
-    publish_debug_clouds: true
+    confirmation:
+      required_frames: 3
+      clear_frames: 2
 
+    max_visualized_clusters: 12
+    publish_debug_clouds: true
