@@ -13,6 +13,8 @@ data/
 experiments/results/*.csv
 experiments/results/*.json
 experiments/results/*.png
+experiments/results/*.log
+experiments/results/baseline-*/
 
 # Python
 __pycache__/
@@ -24,4 +26,3 @@ __pycache__/
 .vscode/
 .DS_Store
 Thumbs.db
-

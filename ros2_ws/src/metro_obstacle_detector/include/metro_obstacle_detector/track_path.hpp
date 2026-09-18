@@ -32,6 +32,7 @@ struct RailEstimatorConfig
   double continuity_penalty{6.0};
   double prior_penalty{1.5};
   double prior_max_deviation_m{0.65};
+  double prior_deviation_growth_per_m{0.015};
   int max_gap_bins{1};
   double candidate_min_separation_m{0.25};
   double branch_min_separation_m{0.45};
@@ -46,6 +47,14 @@ struct TrackCenterSample
 {
   double forward_m{0.0};
   double lateral_m{0.0};
+};
+
+struct SeparatorBoundary
+{
+  double min_forward_m;
+  double max_forward_m;
+  double intercept_m;
+  double slope;
 };
 
 struct TrackPath
@@ -70,7 +79,8 @@ public:
 
   TrackPath estimate(
     const std::vector<Eigen::Vector3f> & points,
-    const TrackPath * prior = nullptr) const;
+    const TrackPath * prior = nullptr,
+    const std::vector<SeparatorBoundary> & separators = {}) const;
 
 private:
   RailEstimatorConfig config_;
@@ -92,12 +102,30 @@ struct LongitudinalMaskConfig
   double forward_bin_size_m{2.0};
   double lateral_cell_size_m{0.05};
   double lane_tolerance_m{0.14};
+  double max_lateral_step_m{0.24};
   int min_points_per_bin{2};
   int min_support_bins{8};
+  int max_gap_bins{1};
   int max_lanes{6};
 };
 
-std::vector<double> find_longitudinal_lanes(
+struct LongitudinalLane
+{
+  std::vector<TrackCenterSample> offsets;
+  double min_forward_m{0.0};
+  double max_forward_m{0.0};
+  std::size_t support_bins{0U};
+  bool fixed{false};
+
+  double offset_at(double forward_m) const;
+  bool covers(double forward_m) const;
+};
+
+LongitudinalLane make_fixed_longitudinal_lane(
+  const TrackPath & path,
+  double offset_m);
+
+std::vector<LongitudinalLane> find_longitudinal_lanes(
   const std::vector<Eigen::Vector3f> & points,
   const TrackPath & path,
   const LongitudinalMaskConfig & config);
@@ -105,7 +133,7 @@ std::vector<double> find_longitudinal_lanes(
 bool is_near_longitudinal_lane(
   const Eigen::Vector3f & point,
   const TrackPath & path,
-  const std::vector<double> & lane_offsets,
+  const std::vector<LongitudinalLane> & lanes,
   double lateral_tolerance_m,
   double minimum_z_m,
   double maximum_z_m);

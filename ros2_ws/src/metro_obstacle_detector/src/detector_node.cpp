@@ -1,4 +1,5 @@
 #include <pcl/common/point_tests.h>
+#include <pcl/common/transforms.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/kdtree/kdtree.h>
 #include <pcl/point_cloud.h>
@@ -12,6 +13,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -24,6 +26,8 @@
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "metro_obstacle_detector/axis_mapping.hpp"
 #include "metro_obstacle_detector/track_path.hpp"
+#include "metro_obstacle_detector/object_tracker.hpp"
+#include "metro_obstacle_detector/cloud_processing.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "std_msgs/msg/bool.hpp"
@@ -58,6 +62,7 @@ struct ClusterInfo
   Eigen::Vector3f maximum;
   float distance_m;
   std::size_t point_count;
+  ObjectState state{};
 };
 
 }  // namespace
@@ -87,6 +92,7 @@ public:
     min_valid_range_m_ = declare_parameter<double>("min_valid_range_m", 0.3);
     max_valid_range_m_ = declare_parameter<double>("max_valid_range_m", 210.0);
     voxel_leaf_size_m_ = declare_parameter<double>("voxel_leaf_size_m", 0.08);
+    far_voxel_leaf_size_m_ = declare_parameter<double>("far_voxel_leaf_size_m", 0.04);
 
     corridor_min_forward_m_ = declare_parameter<double>("corridor.min_forward_m", 2.0);
     corridor_max_forward_m_ = declare_parameter<double>("corridor.max_forward_m", 200.0);
@@ -123,6 +129,8 @@ public:
     track_config.prior_penalty = declare_parameter<double>("track.prior_penalty", 1.5);
     track_config.prior_max_deviation_m = declare_parameter<double>(
       "track.prior_max_deviation_m", 0.65);
+    track_config.prior_deviation_growth_per_m = declare_parameter<double>(
+      "track.prior_deviation_growth_per_m", 0.015);
     track_config.max_gap_bins = declare_parameter<int>("track.max_gap_bins", 1);
     track_config.candidate_min_separation_m = declare_parameter<double>(
       "track.candidate_min_separation_m", 0.25);
@@ -159,12 +167,23 @@ public:
       "longitudinal_mask.lateral_cell_size_m", 0.05);
     longitudinal_mask_config_.lane_tolerance_m = declare_parameter<double>(
       "longitudinal_mask.lane_tolerance_m", 0.14);
+    longitudinal_mask_config_.max_lateral_step_m = declare_parameter<double>(
+      "longitudinal_mask.max_lateral_step_m", 0.24);
     longitudinal_mask_config_.min_points_per_bin = declare_parameter<int>(
       "longitudinal_mask.min_points_per_bin", 2);
     longitudinal_mask_config_.min_support_bins = declare_parameter<int>(
       "longitudinal_mask.min_support_bins", 8);
+    longitudinal_mask_config_.max_gap_bins = declare_parameter<int>(
+      "longitudinal_mask.max_gap_bins", 1);
     longitudinal_mask_config_.max_lanes = declare_parameter<int>(
       "longitudinal_mask.max_lanes", 6);
+    fixed_longitudinal_offsets_ = declare_parameter<std::vector<double>>(
+      "longitudinal_mask.fixed_offsets_m", {-1.0, 1.0});
+    for (const double offset : fixed_longitudinal_offsets_) {
+      if (std::abs(offset) > longitudinal_mask_config_.corridor_half_width_m) {
+        throw std::invalid_argument("longitudinal_mask.fixed_offsets_m must be inside corridor");
+      }
+    }
     infrastructure_min_length_m_ = declare_parameter<double>(
       "infrastructure_filter.min_length_m", 3.0);
     infrastructure_max_height_above_floor_m_ = declare_parameter<double>(
@@ -183,6 +202,14 @@ public:
     publish_debug_clouds_ = declare_parameter<bool>("publish_debug_clouds", true);
     confirmation_required_frames_ = declare_parameter<int>("confirmation.required_frames", 3);
     confirmation_clear_frames_ = declare_parameter<int>("confirmation.clear_frames", 2);
+    adaptive_growth_ = declare_parameter<double>("clustering.radius_growth", 0.006);
+    adaptive_max_radius_ = declare_parameter<double>("clustering.max_tolerance_m", 0.60);
+    motion_enabled_ = declare_parameter<bool>("motion.enabled", true);
+    separators_enabled_ = declare_parameter<bool>("separators.enabled", true);
+    accumulation_frames_ = declare_parameter<int>("motion.accumulation_frames", 1);
+    if (adaptive_growth_ < 0 || adaptive_max_radius_ < cluster_tolerance_m_ ||
+      accumulation_frames_ < 1 || accumulation_frames_ > 5)
+    {throw std::invalid_argument("Invalid adaptive clustering or accumulation parameters");}
 
     if (corridor_max_forward_m_ <= corridor_min_forward_m_) {
       throw std::invalid_argument("corridor.max_forward_m must exceed corridor.min_forward_m");
@@ -190,7 +217,7 @@ public:
     if (corridor_width_m_ <= 0.0 || corridor_height_m_ <= 0.0) {
       throw std::invalid_argument("Corridor width and height must be positive");
     }
-    if (voxel_leaf_size_m_ <= 0.0 || cluster_tolerance_m_ <= 0.0) {
+    if (voxel_leaf_size_m_ <= 0.0 || far_voxel_leaf_size_m_ <= 0.0 || cluster_tolerance_m_ <= 0.0) {
       throw std::invalid_argument("Voxel leaf size and cluster tolerance must be positive");
     }
     if (path_smoothing_alpha_ <= 0.0 || path_smoothing_alpha_ > 1.0 ||
@@ -279,35 +306,31 @@ private:
 
   std::vector<ClusterInfo> cluster_candidates(
     const Cloud::Ptr & candidates,
-    const TrackPath & path) const
+    const TrackPath & path, std::size_t current_points) const
   {
     std::vector<ClusterInfo> result;
     if (candidates->size() < static_cast<std::size_t>(min_cluster_points_)) {
       return result;
     }
 
-    auto tree = std::make_shared<pcl::search::KdTree<Point>>();
-    tree->setInputCloud(candidates);
-
-    std::vector<pcl::PointIndices> cluster_indices;
-    pcl::EuclideanClusterExtraction<Point> extractor;
-    extractor.setClusterTolerance(cluster_tolerance_m_);
-    extractor.setMinClusterSize(min_cluster_points_);
-    extractor.setMaxClusterSize(max_cluster_points_);
-    extractor.setSearchMethod(tree);
-    extractor.setInputCloud(candidates);
-    extractor.extract(cluster_indices);
+    const auto cluster_indices = adaptive_clusters(candidates, cluster_tolerance_m_,
+      adaptive_growth_, adaptive_max_radius_, min_cluster_points_, max_cluster_points_);
 
     for (const auto & indices : cluster_indices) {
       Eigen::Vector3f minimum = Eigen::Vector3f::Constant(std::numeric_limits<float>::max());
       Eigen::Vector3f maximum = Eigen::Vector3f::Constant(std::numeric_limits<float>::lowest());
 
-      for (const int point_index : indices.indices) {
+      std::size_t observed = 0;
+      for (const int point_index : indices) {
+        if (static_cast<std::size_t>(point_index) < current_points) {++observed;}
         const auto & point = candidates->points.at(static_cast<std::size_t>(point_index));
         const Eigen::Vector3f value(point.x, point.y, point.z);
         minimum = minimum.cwiseMin(value);
         maximum = maximum.cwiseMax(value);
       }
+
+      // Historical points must never keep an absent object alive by themselves.
+      if (observed < 2U) {continue;}
 
       const Eigen::Vector3f size = maximum - minimum;
       if (size.z() < min_cluster_height_m_ ||
@@ -335,7 +358,7 @@ private:
       }
 
       result.push_back(
-        ClusterInfo{minimum, maximum, minimum.x(), indices.indices.size()});
+        ClusterInfo{minimum, maximum, minimum.x(), observed});
     }
 
     return result;
@@ -412,12 +435,41 @@ private:
     return marker;
   }
 
+  visualization_msgs::msg::Marker make_longitudinal_lane_marker(
+    int id,
+    const std_msgs::msg::Header & header,
+    const TrackPath & path,
+    const LongitudinalLane & lane) const
+  {
+    visualization_msgs::msg::Marker marker;
+    marker.header = header;
+    marker.header.frame_id = detector_frame_id_;
+    marker.ns = "masked_longitudinal_structure";
+    marker.id = id;
+    marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    marker.action = visualization_msgs::msg::Marker::ADD;
+    marker.pose.orientation.w = 1.0;
+    marker.scale.x = 0.04;
+    marker.color.r = 0.8F;
+    marker.color.g = 0.1F;
+    marker.color.b = 1.0F;
+    marker.color.a = 0.9F;
+    for (double forward = lane.min_forward_m; forward <= lane.max_forward_m; forward += 1.0) {
+      geometry_msgs::msg::Point point;
+      point.x = forward;
+      point.y = path.center_at(forward) + lane.offset_at(forward);
+      point.z = corridor_bottom_z_m_ + 0.12;
+      marker.points.push_back(point);
+    }
+    return marker;
+  }
+
   void publish_markers(
     const std_msgs::msg::Header & source_header,
     const std::vector<ClusterInfo> & clusters,
     int nearest_index,
     const TrackPath & path,
-    const std::vector<double> & longitudinal_lanes) const
+    const std::vector<LongitudinalLane> & longitudinal_lanes) const
   {
     visualization_msgs::msg::MarkerArray array;
 
@@ -426,6 +478,33 @@ private:
     clear.header.frame_id = detector_frame_id_;
     clear.action = visualization_msgs::msg::Marker::DELETEALL;
     array.markers.push_back(clear);
+
+    int separator_id = 40;
+    for (const auto & boundary : separators_) {
+      TrackPath line;
+      line.valid = true;
+      line.min_forward_m = boundary.min_forward_m;
+      line.max_forward_m = boundary.max_forward_m;
+      line.coefficients = {boundary.intercept_m, boundary.slope, 0};
+      array.markers.push_back(make_path_marker(separator_id++, "separator_hint", source_header,
+        line, 0, corridor_bottom_z_m_ + 1.0, .8F, .8F, .8F, .8F, .05F));
+    }
+    visualization_msgs::msg::Marker status;
+    status.header = source_header;
+    status.header.frame_id = detector_frame_id_;
+    status.ns = "detector_status";
+    status.id = 60;
+    status.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+    status.action = visualization_msgs::msg::Marker::ADD;
+    status.pose.orientation.w = 1;
+    status.pose.position.x = 5;
+    status.pose.position.z = 1;
+    status.scale.z = .3;
+    status.color.r = status.color.g = status.color.b = status.color.a = 1;
+    status.text = std::string("motion=") + (motion_valid_ ? "valid" : "unavailable") +
+      " path=" + (path.valid ? "estimated" : "manual/unverified") +
+      " accumulation=" + std::to_string(accumulation_frames_);
+    array.markers.push_back(status);
 
     if (path.valid) {
       const double half_width = corridor_width_m_ / 2.0;
@@ -445,10 +524,9 @@ private:
           5, "dynamic_corridor", source_header, path, half_width,
           corridor_bottom_z_m_, 0.1F, 1.0F, 0.2F, 0.95F, 0.08F));
       int lane_id = 20;
-      for (const double lane : longitudinal_lanes) {
-        array.markers.push_back(make_path_marker(
-            lane_id++, "masked_longitudinal_structure", source_header, path, lane,
-            corridor_bottom_z_m_ + 0.12, 0.8F, 0.1F, 1.0F, 0.9F, 0.04F));
+      for (const auto & lane : longitudinal_lanes) {
+        array.markers.push_back(make_longitudinal_lane_marker(
+            lane_id++, source_header, path, lane));
       }
       if (path.branch_ambiguous) {
         visualization_msgs::msg::Marker ambiguity;
@@ -492,11 +570,13 @@ private:
         break;
       }
       const bool nearest = static_cast<int>(index) == nearest_index;
+      const auto & state = clusters[index].state;
+      const float green = state.confirmed ? 0.05F : (state.hits > 1 ? 0.45F : 0.85F);
       array.markers.push_back(
         make_cube_marker(
           marker_id++, "candidate_boxes", source_header,
           clusters[index].minimum, clusters[index].maximum,
-          nearest ? 1.0F : 1.0F, nearest ? 0.05F : 0.55F, 0.05F, nearest ? 0.75F : 0.45F));
+          1.0F, green, 0.05F, state.confirmed ? 0.65F : 0.35F));
 
       visualization_msgs::msg::Marker label;
       label.header = source_header;
@@ -511,12 +591,15 @@ private:
       label.pose.orientation.w = 1.0;
       label.scale.z = 0.35;
       label.color.r = 1.0F;
-      label.color.g = nearest ? 0.1F : 0.7F;
+      label.color.g = green;
       label.color.b = 0.1F;
       label.color.a = 1.0F;
       std::ostringstream text;
       text.precision(1);
-      text << std::fixed << clusters[index].distance_m << " m / " << clusters[index].point_count << " pts";
+      text << "#" << state.id << " " << (state.confirmed ? "confirmed" : "candidate")
+           << " " << state.hits << "/" << confirmation_required_frames_
+           << (nearest ? " nearest " : " ") << std::fixed << clusters[index].distance_m
+           << " m / " << clusters[index].point_count << " current pts";
       label.text = text.str();
       array.markers.push_back(label);
       ++shown;
@@ -565,12 +648,67 @@ private:
       valid_cloud->push_back(transformed);
     }
 
+    // Keep the original 8 cm cloud for rail estimation and motion. A separate
+    // denser far cloud improves small-object detection without changing the path.
     auto filtered_cloud = std::make_shared<Cloud>();
     pcl::VoxelGrid<Point> voxel_filter;
     voxel_filter.setInputCloud(valid_cloud);
     const auto leaf = static_cast<float>(voxel_leaf_size_m_);
     voxel_filter.setLeafSize(leaf, leaf, leaf);
     voxel_filter.filter(*filtered_cloud);
+
+    auto detection_cloud = std::make_shared<Cloud>();
+    auto near_cloud = std::make_shared<Cloud>();
+    auto far_cloud = std::make_shared<Cloud>();
+    for (const auto & p : *valid_cloud) {
+      (p.x < 30.0F ? near_cloud : far_cloud)->push_back(p);
+    }
+    voxel_filter.setInputCloud(near_cloud);
+    voxel_filter.setLeafSize(leaf, leaf, leaf);
+    voxel_filter.filter(*detection_cloud);
+    Cloud filtered_far;
+    voxel_filter.setInputCloud(far_cloud);
+    const auto far_leaf = static_cast<float>(far_voxel_leaf_size_m_);
+    voxel_filter.setLeafSize(far_leaf, far_leaf, far_leaf);
+    voxel_filter.filter(filtered_far);
+    *detection_cloud += filtered_far;
+
+    const double stamp = rclcpp::Time(message->header.stamp).seconds();
+    const double dt = last_cloud_stamp_ < 0 ? 0.0 : stamp - last_cloud_stamp_;
+    MotionEstimate motion;
+    if (motion_enabled_ && dt > 0 && dt <= 0.5) {
+      motion = estimate_motion(previous_cloud_, filtered_cloud, dt);
+    }
+    if (dt <= 0 || dt > 0.5) {
+      tracker_.reset();
+      current_track_path_ = TrackPath{};
+      history_.clear();
+      track_missing_frames_ = 0;
+    } else if (motion_enabled_ && !motion.valid) {
+      // Never accumulate unregistered points. Keep the prior path and object
+      // tracks: the current frame still has conservative association gates.
+      history_.clear();
+    }
+    if (motion.valid) {
+      for (auto & sample : current_track_path_.centerline) {
+        const Eigen::Vector4f p = motion.previous_to_current * Eigen::Vector4f(
+          sample.forward_m, sample.lateral_m, corridor_bottom_z_m_, 1.0F);
+        sample.forward_m = p.x();
+        sample.lateral_m = p.y();
+      }
+      if (!current_track_path_.centerline.empty()) {
+        current_track_path_.min_forward_m = current_track_path_.centerline.front().forward_m;
+        current_track_path_.max_forward_m = current_track_path_.centerline.back().forward_m;
+      }
+      for (auto & history : history_) {
+        pcl::transformPointCloud(*history, *history, motion.previous_to_current);
+      }
+    }
+    previous_cloud_ = filtered_cloud;
+    last_cloud_stamp_ = stamp;
+    motion_valid_ = motion.valid;
+    separators_ = separators_enabled_ ? find_separators(filtered_cloud, corridor_bottom_z_m_) :
+      std::vector<SeparatorBoundary>{};
 
     if (track_enabled_) {
       std::vector<Eigen::Vector3f> track_points;
@@ -579,7 +717,8 @@ private:
         track_points.emplace_back(point.x, point.y, point.z);
       }
       const TrackPath estimated = rail_path_estimator_->estimate(
-        track_points, current_track_path_.valid ? &current_track_path_ : nullptr);
+        track_points, current_track_path_.valid ? &current_track_path_ : nullptr,
+        separators_);
       if (estimated.valid) {
         if (current_track_path_.valid) {
           TrackPath smoothed = estimated;
@@ -616,17 +755,42 @@ private:
       for (const auto & point : filtered_cloud->points) {
         low_structure_points.emplace_back(point.x, point.y, point.z);
       }
-      current_longitudinal_lanes_ = find_longitudinal_lanes(
+      for (const double offset : fixed_longitudinal_offsets_) {
+        current_longitudinal_lanes_.push_back(
+          make_fixed_longitudinal_lane(current_track_path_, offset));
+      }
+      const auto discovered_lanes = find_longitudinal_lanes(
         low_structure_points, current_track_path_, longitudinal_mask_config_);
+      for (const auto & lane : discovered_lanes) {
+        const bool distinct = std::all_of(
+          current_longitudinal_lanes_.begin(), current_longitudinal_lanes_.end(),
+          [&](const LongitudinalLane & selected) {
+            const double start = std::max(selected.min_forward_m, lane.min_forward_m);
+            const double end = std::min(selected.max_forward_m, lane.max_forward_m);
+            if (end <= start) {
+              return true;
+            }
+            const double middle = 0.5 * (start + end);
+            const bool equivalent =
+              std::abs(selected.offset_at(start) - lane.offset_at(start)) <
+              longitudinal_mask_config_.lane_tolerance_m &&
+              std::abs(selected.offset_at(middle) - lane.offset_at(middle)) <
+              longitudinal_mask_config_.lane_tolerance_m &&
+              std::abs(selected.offset_at(end) - lane.offset_at(end)) <
+              longitudinal_mask_config_.lane_tolerance_m;
+            return !equivalent;
+          });
+        if (distinct) {current_longitudinal_lanes_.push_back(lane);}
+      }
     }
 
     auto candidate_cloud = std::make_shared<Cloud>();
-    candidate_cloud->reserve(filtered_cloud->size() / 10U);
+    candidate_cloud->reserve(detection_cloud->size() / 10U);
     const double half_width = corridor_width_m_ / 2.0;
     const double candidate_bottom = corridor_bottom_z_m_ + floor_clearance_m_;
     const double corridor_top = corridor_bottom_z_m_ + corridor_height_m_;
 
-    for (const auto & point : filtered_cloud->points) {
+    for (const auto & point : detection_cloud->points) {
       if (point.x < corridor_min_forward_m_ || point.x > corridor_max_forward_m_) {
         continue;
       }
@@ -657,39 +821,54 @@ private:
       candidate_cloud->push_back(point);
     }
 
-    const auto clusters = cluster_candidates(candidate_cloud, current_track_path_);
+    const auto current_points = candidate_cloud->size();
+    auto current_far = std::make_shared<Cloud>();
+    for (const auto & p : *candidate_cloud) {
+      if (p.x >= 30.0F) {current_far->push_back(p);}
+    }
+    if (motion.valid && accumulation_frames_ > 1) {
+      for (const auto & history : history_) {
+        for (const auto & p : *history) {
+          const double center = current_track_path_.valid ?
+            current_track_path_.center_at(p.x) : corridor_center_lateral_m_;
+          if (p.x >= 30 && p.x <= corridor_max_forward_m_ &&
+            (!current_track_path_.valid || p.x <= current_track_path_.max_forward_m) &&
+            std::abs(p.y - center) <= half_width && p.z >= candidate_bottom && p.z <= corridor_top)
+          {candidate_cloud->push_back(p);}
+        }
+      }
+    }
+    history_.push_back(current_far);
+    while (history_.size() >= static_cast<std::size_t>(accumulation_frames_)) {history_.pop_front();}
+    auto clusters = cluster_candidates(candidate_cloud, current_track_path_, current_points);
+    std::vector<ObjectObservation> observations;
+    for (const auto & cluster : clusters) {
+      observations.push_back({0.5F * (cluster.minimum + cluster.maximum), cluster.maximum - cluster.minimum});
+    }
+    const auto states = tracker_.update(observations, confirmation_required_frames_,
+      confirmation_clear_frames_, motion.previous_to_current);
+    for (std::size_t i = 0; i < clusters.size(); ++i) {clusters[i].state = states[i];}
+    std::stable_sort(clusters.begin(), clusters.end(), [](const auto & a, const auto & b) {
+      if (a.state.confirmed != b.state.confirmed) {return a.state.confirmed > b.state.confirmed;}
+      return a.distance_m < b.distance_m;
+    });
     int nearest_index = -1;
     float nearest_distance = std::numeric_limits<float>::max();
     for (std::size_t index = 0; index < clusters.size(); ++index) {
-      if (clusters[index].distance_m < nearest_distance) {
+      if (clusters[index].state.confirmed && clusters[index].distance_m < nearest_distance) {
         nearest_distance = clusters[index].distance_m;
         nearest_index = static_cast<int>(index);
       }
     }
 
-    const bool raw_detected = nearest_index >= 0;
-    if (raw_detected) {
-      ++detection_hit_streak_;
-      detection_miss_streak_ = 0;
-      last_detection_distance_m_ = nearest_distance;
-      if (detection_hit_streak_ >= confirmation_required_frames_) {
-        confirmed_detected_ = true;
-      }
-    } else {
-      detection_hit_streak_ = 0;
-      ++detection_miss_streak_;
-      if (detection_miss_streak_ >= confirmation_clear_frames_) {
-        confirmed_detected_ = false;
-        last_detection_distance_m_ = -1.0F;
-      }
-    }
+    const bool raw_detected = !clusters.empty();
 
     std_msgs::msg::Bool detected_message;
-    detected_message.data = confirmed_detected_;
+    detected_message.data = nearest_index >= 0;
     detected_publisher_->publish(detected_message);
 
     std_msgs::msg::Float32 distance_message;
-    distance_message.data = detected_message.data ? last_detection_distance_m_ : -1.0F;
+    distance_message.data = detected_message.data ? nearest_distance : -1.0F;
     distance_publisher_->publish(distance_message);
 
     if (publish_debug_clouds_) {
@@ -740,6 +919,7 @@ private:
   double min_valid_range_m_;
   double max_valid_range_m_;
   double voxel_leaf_size_m_;
+  double far_voxel_leaf_size_m_;
   double corridor_min_forward_m_;
   double corridor_max_forward_m_;
   double corridor_center_lateral_m_;
@@ -758,6 +938,7 @@ private:
   double rail_mask_max_z_m_;
   bool longitudinal_mask_enabled_;
   LongitudinalMaskConfig longitudinal_mask_config_;
+  std::vector<double> fixed_longitudinal_offsets_;
   double infrastructure_min_length_m_;
   double infrastructure_max_height_above_floor_m_;
   double infrastructure_rail_overlap_margin_m_;
@@ -772,14 +953,21 @@ private:
   bool publish_debug_clouds_;
   int confirmation_required_frames_;
   int confirmation_clear_frames_;
-  int detection_hit_streak_{0};
-  int detection_miss_streak_{0};
-  bool confirmed_detected_{false};
-  float last_detection_distance_m_{-1.0F};
+  ObjectTracker tracker_;
+  double adaptive_growth_;
+  double adaptive_max_radius_;
+  bool motion_enabled_;
+  bool motion_valid_{false};
+  bool separators_enabled_;
+  std::vector<SeparatorBoundary> separators_;
+  int accumulation_frames_;
+  double last_cloud_stamp_{-1.0};
+  Cloud::ConstPtr previous_cloud_;
+  std::deque<Cloud::Ptr> history_;
 
   std::unique_ptr<RailPathEstimator> rail_path_estimator_;
   TrackPath current_track_path_;
-  std::vector<double> current_longitudinal_lanes_;
+  std::vector<LongitudinalLane> current_longitudinal_lanes_;
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subscription_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr detected_publisher_;

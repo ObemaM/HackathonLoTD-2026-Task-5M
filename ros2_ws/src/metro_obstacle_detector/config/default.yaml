@@ -16,6 +16,7 @@
     min_valid_range_m: 0.3
     max_valid_range_m: 210.0
     voxel_leaf_size_m: 0.08
+    far_voxel_leaf_size_m: 0.04
 
     corridor:
       min_forward_m: 2.0
@@ -53,6 +54,7 @@
       continuity_penalty: 6.0
       prior_penalty: 1.5
       prior_max_deviation_m: 0.65
+      prior_deviation_growth_per_m: 0.015
       max_gap_bins: 1
       candidate_min_separation_m: 0.25
       branch_min_separation_m: 0.45
@@ -82,9 +84,14 @@
       forward_bin_size_m: 2.0
       lateral_cell_size_m: 0.05
       lane_tolerance_m: 0.14
+      # Follow a rail that curves by at most 24 cm per two-metre slice.
+      max_lateral_step_m: 0.24
       min_points_per_bin: 2
       min_support_bins: 8
+      max_gap_bins: 1
       max_lanes: 6
+      # Contact/guard rails seen consistently in the five moving bags.
+      fixed_offsets_m: [-1.0, 1.0]
 
     # Rail returns can remain connected through sleepers after point masking.
     # Reject only long, low clusters that still overlap an estimated rail. A
@@ -96,6 +103,8 @@
 
     clustering:
       tolerance_m: 0.30
+      radius_growth: 0.006
+      max_tolerance_m: 0.60
       min_points: 3
       max_points: 50000
       min_height_m: 0.08
@@ -106,6 +115,15 @@
     confirmation:
       required_frames: 3
       clear_frames: 2
+
+    # ICP on surrounding infrastructure. Failed registration resets temporal state.
+    motion:
+      enabled: true
+      accumulation_frames: 1  # opt in to 3 after checking registration on a sequence
+
+    separators:
+      # Experimental: real-bag replay found false separator chains in tunnel geometry.
+      enabled: false  # soft hint only; never removes objects inside the corridor
 
     max_visualized_clusters: 12
     publish_debug_clouds: true

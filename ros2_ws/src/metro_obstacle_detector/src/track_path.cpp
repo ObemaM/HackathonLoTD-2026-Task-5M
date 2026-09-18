@@ -68,6 +68,7 @@ RailPathEstimator::RailPathEstimator(RailEstimatorConfig config)
     config_.min_support_bins < 3 || config_.max_center_step_m <= 0.0 ||
     config_.max_slope_change <= 0.0 || config_.seed_search_bins < 1 ||
     config_.seed_max_offset_m <= 0.0 || config_.prior_max_deviation_m <= 0.0 ||
+    config_.prior_deviation_growth_per_m < 0.0 ||
     config_.max_gap_bins < 0 || config_.candidate_min_separation_m <= 0.0 ||
     config_.branch_min_separation_m <= config_.candidate_min_separation_m ||
     config_.branch_max_separation_m <= config_.branch_min_separation_m ||
@@ -81,7 +82,8 @@ RailPathEstimator::RailPathEstimator(RailEstimatorConfig config)
 
 TrackPath RailPathEstimator::estimate(
   const std::vector<Eigen::Vector3f> & points,
-  const TrackPath * prior) const
+  const TrackPath * prior,
+  const std::vector<SeparatorBoundary> & separators) const
 {
   TrackPath result;
   result.min_forward_m = config_.min_forward_m;
@@ -280,7 +282,12 @@ TrackPath RailPathEstimator::estimate(
       double prior_cost = 0.0;
       if (prior != nullptr && prior->valid) {
         const double prior_error = candidate.center_m - prior->center_at(forward);
-        if (std::abs(prior_error) > config_.prior_max_deviation_m) {
+        // The same curve moves toward the sensor between frames, so its far
+        // section can legitimately differ more than the near anchor. Growth is
+        // capped by continuity and remains well below adjacent-track spacing.
+        const double allowed_prior_deviation = config_.prior_max_deviation_m +
+          config_.prior_deviation_growth_per_m * std::max(0.0, forward - 15.0);
+        if (std::abs(prior_error) > allowed_prior_deviation) {
           continue;
         }
         prior_cost = config_.prior_penalty * prior_error * prior_error;
@@ -290,6 +297,18 @@ TrackPath RailPathEstimator::estimate(
         candidate.emission - config_.continuity_penalty *
         prediction_error * prediction_error - prior_cost,
         slope});
+      // A chain of narrow upright structures is only a soft route hint.
+      // It never suppresses obstacle returns, and is not extended beyond support.
+      for (const auto & boundary : separators) {
+        if (forward < boundary.min_forward_m || forward > boundary.max_forward_m) {continue;}
+        const double seed_side = seed.center_m -
+          (boundary.intercept_m + boundary.slope * seed_forward);
+        const double candidate_side = candidate.center_m -
+          (boundary.intercept_m + boundary.slope * forward);
+        if (std::abs(seed_side) > 1.0 && seed_side * candidate_side < 0) {
+          valid.back().value -= 4.0;
+        }
+      }
     }
 
     if (valid.empty()) {
@@ -429,6 +448,8 @@ TrackPath RailPathEstimator::estimate(
 
   result.valid = true;
   result.centerline = std::move(samples);
+  // Do not draw unsupported rails backwards from the first actual observation.
+  result.min_forward_m = result.centerline.front().forward_m;
   result.support_bins = result.centerline.size();
   result.score = total_score;
   const double last_supported_forward = result.centerline.back().forward_m;
@@ -460,15 +481,61 @@ bool is_near_rail(
   return std::min(left_distance, right_distance) <= lateral_tolerance_m;
 }
 
-std::vector<double> find_longitudinal_lanes(
+double LongitudinalLane::offset_at(double forward_m) const
+{
+  if (offsets.empty()) {
+    return 0.0;
+  }
+  const double clamped = std::clamp(forward_m, offsets.front().forward_m, offsets.back().forward_m);
+  const auto upper = std::upper_bound(
+    offsets.begin(), offsets.end(), clamped,
+    [](double value, const TrackCenterSample & sample) {return value < sample.forward_m;});
+  if (upper == offsets.begin()) {
+    return upper->lateral_m;
+  }
+  if (upper == offsets.end()) {
+    return offsets.back().lateral_m;
+  }
+  const auto & right = *upper;
+  const auto & left = *(upper - 1);
+  const double span = right.forward_m - left.forward_m;
+  if (span <= std::numeric_limits<double>::epsilon()) {
+    return left.lateral_m;
+  }
+  const double ratio = (clamped - left.forward_m) / span;
+  return left.lateral_m + ratio * (right.lateral_m - left.lateral_m);
+}
+
+bool LongitudinalLane::covers(double forward_m) const
+{
+  return !offsets.empty() && forward_m >= min_forward_m && forward_m <= max_forward_m;
+}
+
+LongitudinalLane make_fixed_longitudinal_lane(const TrackPath & path, double offset_m)
+{
+  LongitudinalLane lane;
+  if (!path.valid || path.max_forward_m <= path.min_forward_m) {
+    return lane;
+  }
+  lane.offsets = {
+    TrackCenterSample{path.min_forward_m, offset_m},
+    TrackCenterSample{path.max_forward_m, offset_m}};
+  lane.min_forward_m = path.min_forward_m;
+  lane.max_forward_m = path.max_forward_m;
+  lane.fixed = true;
+  return lane;
+}
+
+std::vector<LongitudinalLane> find_longitudinal_lanes(
   const std::vector<Eigen::Vector3f> & points,
   const TrackPath & path,
   const LongitudinalMaskConfig & config)
 {
   if (!path.valid || config.maximum_z_m <= config.minimum_z_m ||
     config.corridor_half_width_m <= 0.0 || config.forward_bin_size_m <= 0.0 ||
-    config.lateral_cell_size_m <= 0.0 || config.min_points_per_bin < 1 ||
-    config.min_support_bins < 1 || config.max_lanes < 1)
+    config.lateral_cell_size_m <= 0.0 || config.lane_tolerance_m <= 0.0 ||
+    config.max_lateral_step_m <= 0.0 || config.min_points_per_bin < 1 ||
+    config.min_support_bins < 1 || config.max_gap_bins < 0 || config.max_lanes < 1)
   {
     return {};
   }
@@ -503,75 +570,129 @@ std::vector<double> find_longitudinal_lanes(
     }
   }
 
-  struct LaneCandidate
+  struct Peak
   {
+    int bin;
     int cell;
-    int support;
     int points;
   };
-  std::vector<LaneCandidate> candidates;
-  for (int cell = 0; cell < lateral_cells; ++cell) {
-    int support = 0;
-    int total = 0;
-    for (int bin = 0; bin < forward_bins; ++bin) {
+  std::vector<Peak> peaks;
+  std::vector<std::vector<int>> peaks_by_bin(static_cast<std::size_t>(forward_bins));
+  for (int bin = 0; bin < forward_bins; ++bin) {
+    for (int cell = 0; cell < lateral_cells; ++cell) {
       const int count = counts[static_cast<std::size_t>(bin * lateral_cells + cell)];
-      total += count;
-      if (count >= config.min_points_per_bin) {
-        ++support;
-      }
-    }
-    if (support < config.min_support_bins) {
-      continue;
-    }
-    bool local_maximum = true;
-    for (int neighbour = std::max(0, cell - 2);
-      neighbour <= std::min(lateral_cells - 1, cell + 2); ++neighbour)
-    {
-      if (neighbour == cell) {
+      if (count < config.min_points_per_bin) {
         continue;
       }
-      int neighbour_support = 0;
-      int neighbour_total = 0;
-      for (int bin = 0; bin < forward_bins; ++bin) {
-        const int count = counts[static_cast<std::size_t>(bin * lateral_cells + neighbour)];
-        neighbour_total += count;
-        if (count >= config.min_points_per_bin) {
-          ++neighbour_support;
+      bool local_maximum = true;
+      for (int neighbour = std::max(0, cell - 2);
+        neighbour <= std::min(lateral_cells - 1, cell + 2); ++neighbour)
+      {
+        if (counts[static_cast<std::size_t>(bin * lateral_cells + neighbour)] > count) {
+          local_maximum = false;
+          break;
         }
       }
-      if (neighbour_support > support ||
-        (neighbour_support == support && neighbour_total > total))
-      {
-        local_maximum = false;
-        break;
+      if (local_maximum) {
+        peaks_by_bin[static_cast<std::size_t>(bin)].push_back(static_cast<int>(peaks.size()));
+        peaks.push_back(Peak{bin, cell, count});
       }
-    }
-    if (local_maximum) {
-      candidates.push_back({cell, support, total});
     }
   }
 
-  std::sort(
-    candidates.begin(), candidates.end(),
-    [](const LaneCandidate & left, const LaneCandidate & right) {
-      if (left.support != right.support) {
-        return left.support > right.support;
-      }
-      return left.points > right.points;
-    });
+  std::vector<LongitudinalLane> lanes;
+  std::vector<bool> available(peaks.size(), true);
+  const int maximum_gap = config.max_gap_bins + 1;
+  const int removal_radius = std::max(
+    1, static_cast<int>(std::floor(
+      2.0 * config.lane_tolerance_m / config.lateral_cell_size_m)));
 
-  std::vector<double> lanes;
-  const double minimum_separation = 2.0 * config.lane_tolerance_m;
-  for (const auto & candidate : candidates) {
-    const double offset = -config.corridor_half_width_m +
-      candidate.cell * config.lateral_cell_size_m;
-    if (std::all_of(
-        lanes.begin(), lanes.end(),
-        [&](double selected) {return std::abs(selected - offset) >= minimum_separation;}))
-    {
-      lanes.push_back(offset);
-      if (lanes.size() >= static_cast<std::size_t>(config.max_lanes)) {
-        break;
+  while (lanes.size() < static_cast<std::size_t>(config.max_lanes)) {
+    std::vector<int> support(peaks.size(), 0);
+    std::vector<double> score(peaks.size(), 0.0);
+    std::vector<int> predecessor(peaks.size(), -1);
+    int best_index = -1;
+
+    for (std::size_t index = 0; index < peaks.size(); ++index) {
+      if (!available[index]) {
+        continue;
+      }
+      support[index] = 1;
+      score[index] = std::log1p(static_cast<double>(peaks[index].points));
+      const int first_bin = std::max(0, peaks[index].bin - maximum_gap);
+      for (int bin = first_bin; bin < peaks[index].bin; ++bin) {
+        const int delta_bins = peaks[index].bin - bin;
+        const double allowed_step = config.max_lateral_step_m * delta_bins;
+        for (const int previous : peaks_by_bin[static_cast<std::size_t>(bin)]) {
+          if (!available[static_cast<std::size_t>(previous)] || support[static_cast<std::size_t>(previous)] == 0) {
+            continue;
+          }
+          const double lateral_change = config.lateral_cell_size_m * std::abs(
+            peaks[index].cell - peaks[static_cast<std::size_t>(previous)].cell);
+          if (lateral_change > allowed_step) {
+            continue;
+          }
+          const int proposed_support = support[static_cast<std::size_t>(previous)] + 1;
+          const double normalized_step = lateral_change / allowed_step;
+          const double proposed_score = score[static_cast<std::size_t>(previous)] +
+            std::log1p(static_cast<double>(peaks[index].points)) -
+            0.35 * normalized_step * normalized_step - 0.25 * (delta_bins - 1);
+          if (proposed_support > support[index] ||
+            (proposed_support == support[index] && proposed_score > score[index]))
+          {
+            support[index] = proposed_support;
+            score[index] = proposed_score;
+            predecessor[index] = previous;
+          }
+        }
+      }
+      if (best_index < 0 || support[index] > support[static_cast<std::size_t>(best_index)] ||
+        (support[index] == support[static_cast<std::size_t>(best_index)] &&
+        score[index] > score[static_cast<std::size_t>(best_index)]))
+      {
+        best_index = static_cast<int>(index);
+      }
+    }
+
+    if (best_index < 0 || support[static_cast<std::size_t>(best_index)] < config.min_support_bins) {
+      break;
+    }
+
+    std::vector<int> chain;
+    for (int index = best_index; index >= 0; index = predecessor[static_cast<std::size_t>(index)]) {
+      chain.push_back(index);
+    }
+    std::reverse(chain.begin(), chain.end());
+
+    LongitudinalLane lane;
+    lane.support_bins = chain.size();
+    for (const int index : chain) {
+      const auto & peak = peaks[static_cast<std::size_t>(index)];
+      lane.offsets.push_back(TrackCenterSample{
+        path.min_forward_m + (peak.bin + 0.5) * config.forward_bin_size_m,
+        -config.corridor_half_width_m + peak.cell * config.lateral_cell_size_m});
+    }
+    if (lane.offsets.size() >= 3U) {
+      auto smoothed = lane.offsets;
+      for (std::size_t index = 1; index + 1 < lane.offsets.size(); ++index) {
+        smoothed[index].lateral_m = 0.25 * lane.offsets[index - 1].lateral_m +
+          0.50 * lane.offsets[index].lateral_m +
+          0.25 * lane.offsets[index + 1].lateral_m;
+      }
+      lane.offsets.swap(smoothed);
+    }
+    lane.min_forward_m = std::max(
+      path.min_forward_m, lane.offsets.front().forward_m - 0.5 * config.forward_bin_size_m);
+    lane.max_forward_m = std::min(
+      path.max_forward_m, lane.offsets.back().forward_m + 0.5 * config.forward_bin_size_m);
+    lanes.push_back(std::move(lane));
+
+    for (const int selected : chain) {
+      const auto & peak = peaks[static_cast<std::size_t>(selected)];
+      for (const int nearby : peaks_by_bin[static_cast<std::size_t>(peak.bin)]) {
+        if (std::abs(peaks[static_cast<std::size_t>(nearby)].cell - peak.cell) <= removal_radius) {
+          available[static_cast<std::size_t>(nearby)] = false;
+        }
       }
     }
   }
@@ -581,7 +702,7 @@ std::vector<double> find_longitudinal_lanes(
 bool is_near_longitudinal_lane(
   const Eigen::Vector3f & point,
   const TrackPath & path,
-  const std::vector<double> & lane_offsets,
+  const std::vector<LongitudinalLane> & lanes,
   double lateral_tolerance_m,
   double minimum_z_m,
   double maximum_z_m)
@@ -591,8 +712,11 @@ bool is_near_longitudinal_lane(
   }
   const double offset = point.y() - path.center_at(point.x());
   return std::any_of(
-    lane_offsets.begin(), lane_offsets.end(),
-    [&](double lane) {return std::abs(offset - lane) <= lateral_tolerance_m;});
+    lanes.begin(), lanes.end(),
+    [&](const LongitudinalLane & lane) {
+      return lane.covers(point.x()) &&
+             std::abs(offset - lane.offset_at(point.x())) <= lateral_tolerance_m;
+    });
 }
 
 }  // namespace metro_obstacle_detector

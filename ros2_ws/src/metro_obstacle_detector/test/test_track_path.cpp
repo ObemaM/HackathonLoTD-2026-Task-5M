@@ -146,6 +146,20 @@ TEST(TrackPath, RejectsInsufficientRailSupport)
   EXPECT_FALSE(RailPathEstimator(config).estimate(sparse).valid);
 }
 
+TEST(TrackPath, CurrentCurveCanDepartFromPriorInFarField)
+{
+  const auto config = test_config();
+  std::vector<Eigen::Vector3f> straight, curved;
+  add_rails(straight, config, [](double) {return 0.0;}, 5);
+  const auto curve = [](double x) {return x > 15 ? -.0015 * (x-15) * (x-15) : 0.0;};
+  add_rails(curved, config, curve, 5);
+  const auto prior = RailPathEstimator(config).estimate(straight);
+  const auto path = RailPathEstimator(config).estimate(curved, &prior);
+  ASSERT_TRUE(path.valid);
+  EXPECT_GT(path.max_forward_m, 40);
+  EXPECT_NEAR(path.center_at(40), curve(40), .25);
+}
+
 TEST(TrackPath, RailMaskOnlyRemovesNarrowExpectedRailBand)
 {
   TrackPath path;
@@ -191,5 +205,48 @@ TEST(TrackPath, FindsPersistentLowLanesButKeepsCompactObject)
       config.lane_tolerance_m, config.minimum_z_m, config.maximum_z_m));
   EXPECT_FALSE(is_near_longitudinal_lane(
       Eigen::Vector3f(10.5F, 0.0F, -1.20F), path, lanes,
+      config.lane_tolerance_m, config.minimum_z_m, config.maximum_z_m));
+}
+
+TEST(TrackPath, FollowsCurvedLongitudinalStructureOnlyWhereSupported)
+{
+  TrackPath path;
+  path.valid = true;
+  path.min_forward_m = 2.0;
+  path.max_forward_m = 50.0;
+  std::vector<Eigen::Vector3f> points;
+  const auto offset = [](double x) {
+      const double delta = x - 16.0;
+      return 0.30 + 0.0008 * delta * delta;
+    };
+  for (double x = 16.1; x < 42.0; x += 0.25) {
+    points.emplace_back(static_cast<float>(x), static_cast<float>(offset(x) - 0.015), -1.30F);
+    points.emplace_back(static_cast<float>(x), static_cast<float>(offset(x) + 0.015), -1.29F);
+  }
+  // A compact low object must not become a longitudinal lane.
+  for (double x = 7.0; x < 8.0; x += 0.08) {
+    points.emplace_back(static_cast<float>(x), -0.25F, -1.20F);
+  }
+
+  LongitudinalMaskConfig config;
+  config.minimum_z_m = -1.65;
+  config.maximum_z_m = -1.0;
+  config.min_points_per_bin = 2;
+  config.min_support_bins = 8;
+  config.max_lateral_step_m = 0.24;
+  const auto lanes = find_longitudinal_lanes(points, path, config);
+
+  ASSERT_FALSE(lanes.empty());
+  EXPECT_TRUE(is_near_longitudinal_lane(
+      Eigen::Vector3f(20.0F, static_cast<float>(offset(20.0)), -1.30F), path, lanes,
+      config.lane_tolerance_m, config.minimum_z_m, config.maximum_z_m));
+  EXPECT_TRUE(is_near_longitudinal_lane(
+      Eigen::Vector3f(39.0F, static_cast<float>(offset(39.0)), -1.30F), path, lanes,
+      config.lane_tolerance_m, config.minimum_z_m, config.maximum_z_m));
+  EXPECT_FALSE(is_near_longitudinal_lane(
+      Eigen::Vector3f(8.0F, -0.25F, -1.20F), path, lanes,
+      config.lane_tolerance_m, config.minimum_z_m, config.maximum_z_m));
+  EXPECT_FALSE(is_near_longitudinal_lane(
+      Eigen::Vector3f(39.0F, static_cast<float>(offset(39.0) - 0.35), -1.30F), path, lanes,
       config.lane_tolerance_m, config.minimum_z_m, config.maximum_z_m));
 }

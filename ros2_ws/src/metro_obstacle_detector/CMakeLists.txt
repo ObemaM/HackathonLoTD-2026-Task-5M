@@ -12,7 +12,7 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(geometry_msgs REQUIRED)
-find_package(PCL REQUIRED COMPONENTS common filters kdtree search segmentation)
+find_package(PCL REQUIRED COMPONENTS common filters kdtree search segmentation registration)
 find_package(pcl_conversions REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -33,6 +33,9 @@ target_link_libraries(detector_core Eigen3::Eigen)
 add_executable(detector_node
   src/detector_node.cpp
 )
+add_library(cloud_processing src/cloud_processing.cpp)
+target_include_directories(cloud_processing PUBLIC include ${PCL_INCLUDE_DIRS})
+target_link_libraries(cloud_processing ${PCL_LIBRARIES} Eigen3::Eigen)
 target_include_directories(detector_node PRIVATE
   include
   ${PCL_INCLUDE_DIRS}
@@ -40,6 +43,7 @@ target_include_directories(detector_node PRIVATE
 target_compile_definitions(detector_node PRIVATE ${PCL_DEFINITIONS})
 target_link_libraries(detector_node
   detector_core
+  cloud_processing
   ${PCL_LIBRARIES}
   Eigen3::Eigen
 )
@@ -53,7 +57,7 @@ ament_target_dependencies(detector_node
   visualization_msgs
 )
 
-install(TARGETS detector_core detector_node
+install(TARGETS detector_core cloud_processing detector_node
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
@@ -70,6 +74,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_track_path test/test_track_path.cpp)
   target_link_libraries(test_track_path detector_core Eigen3::Eigen)
   target_include_directories(test_track_path PRIVATE include)
+
+  ament_add_gtest(test_perception test/test_perception.cpp)
+  target_link_libraries(test_perception cloud_processing detector_core Eigen3::Eigen)
 endif()
 
 ament_package()

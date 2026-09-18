@@ -74,8 +74,10 @@
       forward_bin_size_m: 2.0
       lateral_cell_size_m: 0.05
       lane_tolerance_m: 0.14
+      max_lateral_step_m: 0.24
       min_points_per_bin: 2
       min_support_bins: 8
+      max_gap_bins: 1
       max_lanes: 6
 
     infrastructure_filter:
@@ -96,5 +98,8 @@
       required_frames: 3
       clear_frames: 2
 
-    max_visualized_clusters: 12
+    # This static bag has many unmasked infrastructure clusters. Keep all of
+    # them visible during calibration; otherwise the confirmed far person can
+    # be hidden behind the 12 nearer marker slots even though it is tracked.
+    max_visualized_clusters: 30
     publish_debug_clouds: true
